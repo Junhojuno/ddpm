@@ -16,6 +16,7 @@ def group_norm(x, name='group_norm'):
 
 
 def default_initializer(scale=1.):
+    scale = 1e-10 if scale == 0 else scale
     return tf.keras.initializers.VarianceScaling(scale, mode='fan_avg', distribution='uniform')
 
 
@@ -52,7 +53,7 @@ def Dense(units, init_scale: float = 1.0, use_bias: bool = True, name: str = 'de
 
 def get_timestep_embedding(timesteps, embedding_dim: int, default_dtype=tf.float32):
     half_dim = embedding_dim // 2
-    emb = tf.math.log(10000) / (half_dim - 1)
+    emb = tf.math.log(10000.) / (half_dim - 1)
     emb = tf.math.exp(tf.range(half_dim, dtype=default_dtype) * -emb)
     emb = tf.cast(timesteps, dtype=default_dtype)[:, None] * emb[None, :]
     emb = tf.concat([tf.math.sin(emb), tf.math.cos(emb)], axis=1)
@@ -87,19 +88,20 @@ def res_block(
     x = group_norm(x, name=f'{prefix}/norm2')
     x = swish(x)
     x = tf.keras.layers.Dropout(dropout)(x)
-    x = Conv2D(out_ch, 3, 1, 'same', init_scale=0.0, name=f'{prefix}/conv2')(x)
+    x = Conv2D(out_ch, 3, 1, 'same', init_scale=0., name=f'{prefix}/conv2')(x)
     
     if C != out_ch:
         if conv_shortcut:
-            x = Conv2D(out_ch, 3, 1, 'same', name=f'{prefix}/conv_shortcut')
+            inputs = Conv2D(out_ch, 3, 1, 'same', name=f'{prefix}/conv_shortcut')(inputs)
         else: # use dense layer instead of nin
-            x = Dense(out_ch, name=f'{prefix}/nin_shortcut')
+            inputs = Dense(out_ch, name=f'{prefix}/nin_shortcut')(inputs)
     assert inputs.shape == x.shape, f'shortcut connection is unavailable, inputs={inputs.shape}, x={x.shape}'
-    return inputs + x
+    # return inputs + x
+    return tf.keras.layers.Add()([inputs, x])
 
 
 def attention_block(inputs, name='att_block'):
-    B, H, W, C = inputs.shape
+    _, H, W, C = inputs.shape
     prefix = name
     h = group_norm(inputs, name=f'{prefix}/norm')
     q = Dense(C, name=f'{prefix}/query')(h)
@@ -107,15 +109,16 @@ def attention_block(inputs, name='att_block'):
     v = Dense(C, name=f'{prefix}/value')(h)
     
     w = tf.einsum('bhwc,bHWc->bhwHW', q, k) * (int(C) ** (-0.5))
-    w = tf.reshape(w, [B, H, W, H * W])
+    w = tf.reshape(w, [-1, H, W, H * W])
     w = tf.nn.softmax(w, -1)
-    w = tf.reshape(w, [B, H, W, H, W])
+    w = tf.reshape(w, [-1, H, W, H, W])
     
     h = tf.einsum('bhwHW,bHWc->bhwc', w, v)
-    h = Dense(C, init_scale=0.0, name=f'{prefix}/proj_out')
+    h = Dense(C, init_scale=0.0, name=f'{prefix}/proj_out')(h)
     
     assert h.shape == inputs.shape
-    return inputs + h
+    # return inputs + h
+    return tf.keras.layers.Add()([inputs, h])
 
 
 def downsample(inputs, with_conv: bool = True, name: str = 'downsample'):
@@ -132,7 +135,7 @@ def downsample(inputs, with_conv: bool = True, name: str = 'downsample'):
 def upsample(inputs, with_conv: bool = True, name: str = 'upsample'):
     prefix = name
     B, H, W, C = inputs.shape
-    x = tf.image.resize(inputs, size=[H * 2, W * 2], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR, align_corners=True)
+    x = tf.image.resize(inputs, size=[H * 2, W * 2], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
     assert x.shape == [B, H * 2, W * 2, C]
     if with_conv:
         x = Conv2D(C, 3, 1, 'same', name=f'{prefix}/conv')(x)
@@ -141,13 +144,9 @@ def upsample(inputs, with_conv: bool = True, name: str = 'upsample'):
 
 
 def UNet(
-    inputs,
-    timestep,
-    y: Optional[tf.Tensor] = None,
-    num_classes: int = 1,
-    reuse=tf.AUTO_REUSE,
+    input_shape,
     ch: int = 128,
-    out_ch: int = 1,
+    out_ch: int = 3,
     ch_mult: Union[List, Tuple]=(1, 2, 4, 8),
     num_res_blocks: int = 2,
     attn_resolutions: Tuple = (16,),
@@ -156,13 +155,15 @@ def UNet(
     name: str = 'unet'
 ):
     num_resolutions = len(ch_mult)
+    inputs = tf.keras.Input(input_shape)
+    timestep = tf.keras.Input([])
     
     prefix = 't_emb'
     t_emb = get_timestep_embedding(timestep, embedding_dim=ch)
     t_emb = Dense(ch * 4, name=f'{prefix}/dense0')(t_emb)
     t_emb = swish(t_emb)
     t_emb = Dense(ch * 4, name=f'{prefix}/dense1')(t_emb)
-    assert t_emb.shape == [x.shape[0], ch * 4]
+    assert t_emb.shape == [inputs.shape[0], ch * 4]
     
     # down-sampling
     xs = [Conv2D(ch, 3, 1, 'same', name='conv_in')(inputs)]
@@ -208,11 +209,11 @@ def UNet(
         # upsample
         if i_level != 0:
             x = upsample(x, with_conv=resamp_with_conv, name=f'{prefix}/upsample')
-        assert not xs
+    assert not xs
         
-        # end
-        x = group_norm(x, name='norm_out')
-        x = swish(x)
-        x = Conv2D(out_ch, 3, 1, 'same', init_scale=0., name='conv_out')(x)
-        assert x.shape == inputs.shape[:3] + [out_ch]
-        return x
+    # end
+    x = group_norm(x, name='norm_out')
+    x = swish(x)
+    x = Conv2D(out_ch, 3, 1, 'same', init_scale=0., name='conv_out')(x)
+    assert x.shape == inputs.shape[:3] + [out_ch]
+    return tf.keras.Model([inputs, timestep], x, name=name)
